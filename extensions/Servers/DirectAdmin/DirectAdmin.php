@@ -7,7 +7,7 @@ use App\Models\Service;
 use App\Rules\Domain;
 use Exception;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class DirectAdmin extends Server
 {
@@ -68,17 +68,6 @@ class DirectAdmin extends Server
                 'type' => 'password',
                 'required' => true,
                 'encrypted' => true,
-            ],
-            [
-                'name' => 'wp_installer',
-                'label' => 'WordPress auto-installer',
-                'type' => 'select',
-                'required' => false,
-                'options' => [
-                    ['label' => 'None', 'value' => 'none'],
-                    ['label' => 'Installatron', 'value' => 'installatron'],
-                    ['label' => 'Softaculous', 'value' => 'softaculous'],
-                ],
             ],
         ];
     }
@@ -168,12 +157,11 @@ class DirectAdmin extends Server
     public function createServer(Service $service, $settings, $properties)
     {
         $password = substr(str_shuffle(str_repeat($x = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ(!@.$%', ceil(10 / strlen($x)))), 1, 12);
-        $username = substr(str_shuffle(str_repeat($x = 'abcdefghijklmnopqrstuvwxyz', ceil(8 / strlen($x)))), 1, 8);
+        $username = $this->generateUsernameFromEmail($service->user->email);
         $settings = array_merge($settings, $properties);
 
         // Read configurable option values (keyed by option name in $properties)
         $storage   = $properties['storage'] ?? null;
-        $wordpress = !empty($properties['wordpress']);
         $bandwidth = $properties['bandwidth'] ?? null;
 
         if (isset($settings['ip'])) {
@@ -231,29 +219,12 @@ class DirectAdmin extends Server
             'value' => $password,
         ]);
 
-        $result = [
+        return [
             'username' => $username,
             'password' => $password,
             'domain'   => $properties['domain'] ?? '',
             'ip'       => $ip,
         ];
-
-        // Attempt WordPress auto-installation when the wordpress option is checked
-        // and an installer is configured on the server extension.
-        if ($wordpress) {
-            $installer = $this->config('wp_installer');
-            if (in_array($installer, ['installatron', 'softaculous'], true)) {
-                try {
-                    $this->installWordPress($service, $username, $password, $properties['domain'] ?? '');
-                    $result['wordpress_installed'] = true;
-                } catch (Exception $e) {
-                    Log::warning('DirectAdmin: WordPress installation failed for user ' . $username . ': ' . $e->getMessage());
-                    $result['wordpress_install_error'] = $e->getMessage();
-                }
-            }
-        }
-
-        return $result;
     }
 
     /**
@@ -446,62 +417,63 @@ class DirectAdmin extends Server
     }
 
     /**
-     * Install WordPress via the configured auto-installer (Installatron or Softaculous).
+     * Derive a unique DirectAdmin username from the customer's email address.
      *
-     * @throws Exception on API / HTTP failure
+     * Rules applied in order:
+     *  1. Take the local part (before @), lowercase it.
+     *  2. Strip any character that is not [a-z0-9].
+     *  3. Empty result → fallback 'user' + 6 random lowercase chars.
+     *  4. First char is a digit → prefix 'u'.
+     *  5. Truncate base to 14 chars (reserves room for a 2-digit collision suffix).
+     *  6. Collision-check via GET /CMD_API_SHOW_USERS; append numeric suffix 1–99,
+     *     then 3 random lowercase alphanum chars as last resort.
+     *  7. Return unique username (always ≤ 16 chars).
      */
-    private function installWordPress(Service $service, string $username, string $password, string $domain): void
+    private function generateUsernameFromEmail(string $email): string
     {
-        $installer = $this->config('wp_installer');
-        $host = rtrim($this->config('host'), '/');
+        $local = strtolower(explode('@', $email)[0]);
+        $base  = preg_replace('/[^a-z0-9]/', '', $local);
 
-        if ($installer === 'installatron') {
-            $response = Http::withBasicAuth(
-                $this->config('username'),
-                $this->config('password')
-            )->asForm()->post(
-                $host . '/CMD_PLUGINS/installatron/index.raw?api=1&api_account=' . urlencode($username) . '&api_pass=' . urlencode($password),
-                [
-                    'mode'              => 'install',
-                    'type'              => '1',
-                    'u'                 => 'wordpress:latest',
-                    'i-path'            => '',
-                    'i-admin_username'  => 'admin',
-                    'i-admin_password'  => $password,
-                    'i-admin_email'     => $service->user->email,
-                    'i-site_title'      => $domain,
-                    'domain'            => $domain,
-                ]
-            )->throw();
+        if ($base === '') {
+            $base = 'user' . strtolower(Str::random(6));
+        }
 
-            $body = $response->body();
-            if (str_contains($body, '<error>') || str_contains($body, 'result="error"')) {
-                throw new Exception('Installatron WordPress installation failed: ' . $body);
+        if (isset($base[0]) && ctype_digit($base[0])) {
+            $base = 'u' . $base;
+        }
+
+        // Truncate to 14 to leave room for up to a 2-digit suffix within the 16-char limit.
+        $base = substr($base, 0, 14);
+
+        // Fetch existing usernames for collision detection.
+        try {
+            $existing = $this->request('/CMD_API_SHOW_USERS', parse: true);
+            if (!is_array($existing)) {
+                $existing = [];
             }
-        } elseif ($installer === 'softaculous') {
-            $response = Http::withBasicAuth(
-                $username,
-                $password
-            )->asForm()->post(
-                $host . '/CMD_PLUGINS/softaculous/index.raw',
-                [
-                    'api'              => 'json',
-                    'act'              => 'software',
-                    'soft'             => '26', // Softaculous script ID for WordPress
-                    'softwareUrl'      => 'https://' . $domain . '/',
-                    'admin_username'   => 'admin',
-                    'admin_pass'       => $password,
-                    'admin_email'      => $service->user->email,
-                    'site_name'        => $domain,
-                    'install_dir'      => '/',
-                    'overwrite_existing' => '0',
-                ]
-            )->throw();
+        } catch (Exception $e) {
+            $existing = [];
+        }
 
-            $json = $response->json();
-            if (!empty($json['error'])) {
-                throw new Exception('Softaculous WordPress installation failed: ' . implode(', ', (array) $json['error']));
+        $candidate = $base;
+
+        if (in_array($candidate, $existing, true)) {
+            $found = false;
+            for ($i = 1; $i <= 99; $i++) {
+                $candidate = $base . $i;
+                if (!in_array($candidate, $existing, true)) {
+                    $found = true;
+                    break;
+                }
+            }
+
+            if (!$found) {
+                // Last resort: 3 random lowercase alphanumeric chars.
+                // Re-truncate base to 13 so that base(13) + suffix(3) = 16 chars max.
+                $candidate = substr($base, 0, 13) . strtolower(Str::random(3));
             }
         }
+
+        return $candidate;
     }
 }
