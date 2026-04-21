@@ -7,6 +7,7 @@ use App\Models\Service;
 use App\Rules\Domain;
 use Exception;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class DirectAdmin extends Server
 {
@@ -68,6 +69,17 @@ class DirectAdmin extends Server
                 'required' => true,
                 'encrypted' => true,
             ],
+            [
+                'name' => 'wp_installer',
+                'label' => 'WordPress auto-installer',
+                'type' => 'select',
+                'required' => false,
+                'options' => [
+                    ['label' => 'None', 'value' => 'none'],
+                    ['label' => 'Installatron', 'value' => 'installatron'],
+                    ['label' => 'Softaculous', 'value' => 'softaculous'],
+                ],
+            ],
         ];
     }
 
@@ -104,7 +116,8 @@ class DirectAdmin extends Server
                 'name' => 'package',
                 'type' => 'select',
                 'label' => 'Package',
-                'required' => true,
+                'required' => false,
+                'description' => 'Base/fallback DirectAdmin package. If a "storage" configurable option is present on the service, the extension will use DirectAdmin\'s custom-limits mode and this package is informational only.',
                 'options' => $packages,
             ],
             [
@@ -149,14 +162,19 @@ class DirectAdmin extends Server
      * Create a server
      *
      * @param  array  $settings  (product settings)
-     * @param  array  $properties  (checkout options)
-     * @return bool
+     * @param  array  $properties  (checkout options / configurable option values)
+     * @return array
      */
     public function createServer(Service $service, $settings, $properties)
     {
         $password = substr(str_shuffle(str_repeat($x = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ(!@.$%', ceil(10 / strlen($x)))), 1, 12);
         $username = substr(str_shuffle(str_repeat($x = 'abcdefghijklmnopqrstuvwxyz', ceil(8 / strlen($x)))), 1, 8);
         $settings = array_merge($settings, $properties);
+
+        // Read configurable option values (keyed by option name in $properties)
+        $storage   = $properties['storage'] ?? null;
+        $wordpress = !empty($properties['wordpress']);
+        $bandwidth = $properties['bandwidth'] ?? null;
 
         if (isset($settings['ip'])) {
             $ip = $settings['ip'];
@@ -168,18 +186,32 @@ class DirectAdmin extends Server
             }
         }
 
-        $response = $this->request('/CMD_API_ACCOUNT_USER', 'post', [
-            'action' => 'create',
-            'add' => 'Submit',
+        $payload = [
+            'action'   => 'create',
+            'add'      => 'Submit',
             'username' => $username,
-            'email' => $service->user->email,
-            'passwd' => $password,
-            'passwd2' => $password,
-            'package' => $settings['package'],
-            'ip' => $ip,
-            'domain' => $properties['domain'] ?? '',
-            'notify' => 'yes',
-        ], parse: true);
+            'email'    => $service->user->email,
+            'passwd'   => $password,
+            'passwd2'  => $password,
+            'ip'       => $ip,
+            'domain'   => $properties['domain'] ?? '',
+            'notify'   => 'yes',
+        ];
+
+        if ($storage !== null) {
+            // Custom-limits mode: send inline resource limits instead of a named package.
+            // Even if a package is configured in product settings it is used only as a label/fallback reference;
+            // DirectAdmin custom= yes overrides it completely.
+            $payload = array_merge($payload, $this->buildCustomLimitsPayload((int) $storage, $bandwidth));
+        } else {
+            // Fallback: use the named package configured on the product.
+            if (empty($settings['package'])) {
+                throw new Exception('No package configured and no storage configurable option provided');
+            }
+            $payload['package'] = $settings['package'];
+        }
+
+        $response = $this->request('/CMD_API_ACCOUNT_USER', 'post', $payload, parse: true);
 
         if ($response['error'] != '0') {
             throw new Exception('Error creating DirectAdmin account: ' . $response['text']);
@@ -199,12 +231,29 @@ class DirectAdmin extends Server
             'value' => $password,
         ]);
 
-        return [
+        $result = [
             'username' => $username,
             'password' => $password,
-            'domain' => $properties['domain'] ?? '',
-            'ip' => $ip,
+            'domain'   => $properties['domain'] ?? '',
+            'ip'       => $ip,
         ];
+
+        // Attempt WordPress auto-installation when the wordpress option is checked
+        // and an installer is configured on the server extension.
+        if ($wordpress) {
+            $installer = $this->config('wp_installer');
+            if (in_array($installer, ['installatron', 'softaculous'], true)) {
+                try {
+                    $this->installWordPress($service, $username, $password, $properties['domain'] ?? '');
+                    $result['wordpress_installed'] = true;
+                } catch (Exception $e) {
+                    Log::warning('DirectAdmin: WordPress installation failed for user ' . $username . ': ' . $e->getMessage());
+                    $result['wordpress_install_error'] = $e->getMessage();
+                }
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -327,5 +376,132 @@ class DirectAdmin extends Server
         }
 
         return $response['details'] ?? '';
+    }
+
+    /**
+     * Upgrade / change plan for an existing account.
+     *
+     * If a "storage" configurable option is present the account is updated with
+     * DirectAdmin's custom-limits mode; otherwise the call is a no-op (named
+     * package upgrades are handled outside this extension).
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (configurable option values)
+     * @return bool
+     */
+    public function upgrade(Service $service, $settings, $properties)
+    {
+        $username = $service->properties()->where('key', 'directadmin_username')->first()?->value;
+
+        if (!$username) {
+            throw new Exception('Service has not been created');
+        }
+
+        $storage   = $properties['storage'] ?? null;
+        $bandwidth = $properties['bandwidth'] ?? null;
+
+        if ($storage !== null) {
+            $response = $this->request('/CMD_API_MODIFY_USER', 'post', array_merge([
+                'action' => 'customize',
+                'user'   => $username,
+            ], $this->buildCustomLimitsPayload((int) $storage, $bandwidth)), parse: true);
+
+            if ($response['error'] != '0') {
+                throw new Exception('Error upgrading DirectAdmin account: ' . $response['text']);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Build the DirectAdmin custom-limits payload array shared by createServer() and upgrade().
+     */
+    private function buildCustomLimitsPayload(int $quota, $bandwidth): array
+    {
+        return [
+            'custom'      => 'yes',
+            'quota'       => $quota,
+            'bandwidth'   => $bandwidth ?: 'unlimited',
+            'vdomains'    => 'unlimited',
+            'nsubdomains' => 'unlimited',
+            'nemails'     => 'unlimited',
+            'nemailf'     => 'unlimited',
+            'nemailml'    => 'unlimited',
+            'nemailr'     => 'unlimited',
+            'mysql'       => 'unlimited',
+            'domainptr'   => 'unlimited',
+            'ftp'         => 'unlimited',
+            'aftp'        => 'ON',
+            'cgi'         => 'ON',
+            'php'         => 'ON',
+            'spam'        => 'ON',
+            'cron'        => 'ON',
+            'catchall'    => 'ON',
+            'ssl'         => 'ON',
+            'ssh'         => 'OFF',
+            'sysinfo'     => 'ON',
+            'dnscontrol'  => 'ON',
+        ];
+    }
+
+    /**
+     * Install WordPress via the configured auto-installer (Installatron or Softaculous).
+     *
+     * @throws Exception on API / HTTP failure
+     */
+    private function installWordPress(Service $service, string $username, string $password, string $domain): void
+    {
+        $installer = $this->config('wp_installer');
+        $host = rtrim($this->config('host'), '/');
+
+        if ($installer === 'installatron') {
+            $response = Http::withBasicAuth(
+                $this->config('username'),
+                $this->config('password')
+            )->asForm()->post(
+                $host . '/CMD_PLUGINS/installatron/index.raw?api=1&api_account=' . urlencode($username) . '&api_pass=' . urlencode($password),
+                [
+                    'mode'              => 'install',
+                    'type'              => '1',
+                    'u'                 => 'wordpress:latest',
+                    'i-path'            => '',
+                    'i-admin_username'  => 'admin',
+                    'i-admin_password'  => $password,
+                    'i-admin_email'     => $service->user->email,
+                    'i-site_title'      => $domain,
+                    'domain'            => $domain,
+                ]
+            )->throw();
+
+            $body = $response->body();
+            if (str_contains($body, '<error>') || str_contains($body, 'result="error"')) {
+                throw new Exception('Installatron WordPress installation failed: ' . $body);
+            }
+        } elseif ($installer === 'softaculous') {
+            $response = Http::withBasicAuth(
+                $username,
+                $password
+            )->asForm()->post(
+                $host . '/CMD_PLUGINS/softaculous/index.raw',
+                [
+                    'api'              => 'json',
+                    'act'              => 'software',
+                    'soft'             => '26', // Softaculous script ID for WordPress
+                    'softwareUrl'      => 'https://' . $domain . '/',
+                    'admin_username'   => 'admin',
+                    'admin_pass'       => $password,
+                    'admin_email'      => $service->user->email,
+                    'site_name'        => $domain,
+                    'install_dir'      => '/',
+                    'overwrite_existing' => '0',
+                ]
+            )->throw();
+
+            $json = $response->json();
+            if (!empty($json['error'])) {
+                throw new Exception('Softaculous WordPress installation failed: ' . implode(', ', (array) $json['error']));
+            }
+        }
     }
 }
