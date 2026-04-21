@@ -31,7 +31,7 @@ Attach a configurable-option group to a product to let customers choose resource
 |---|---|---|---|
 | `storage` | Radio / Select | `5000`, `10000`, `15000` | Raw MB value — label can be anything (e.g. "5 GB"). When present, custom-limits mode is used. |
 | `bandwidth` | Radio / Select / Hidden | `100000` | Raw MB. Omit or set to `0` for unlimited. |
-| `wordpress` | Checkbox | `0` / `1` | **Billing only** — see section below. |
+| `wordpress` | Checkbox | `0` / `1` | Toggles DirectAdmin's built-in WordPress Manager feature flag for the user. |
 
 ### Storage tiers (example setup)
 
@@ -47,19 +47,18 @@ Options:
 
 When `storage` is set the account is created with `custom=yes` and the inline quota value. If the customer later upgrades (selects a higher tier), Paymenter calls `CMD_API_MODIFY_USER` to resize the live account in real-time — no new account is created.
 
+**Each DirectAdmin account created through this extension is limited to 1 primary domain and 0 domain aliases. Subdomains under the primary domain are unlimited.**
+
 ---
 
-## WordPress configurable option (billing only)
+## WordPress Manager configurable option
 
-A `wordpress` checkbox option can be added to your configurable-option group for billing purposes. When a customer selects it they are **charged** for the WordPress add-on, but **WordPress is not installed automatically**.
+The `wordpress` configurable option toggles DirectAdmin's built-in **WordPress Manager** for the user. When checked, the user sees WordPress Manager in their DA panel and can install/manage WP sites themselves. When unchecked, the menu is hidden (existing installs are NOT removed — DA just hides the UI).
 
-The customer (or you as the administrator) installs WordPress manually through DirectAdmin's built-in auto-installer panel:
+- `wordpress=ON` — WordPress Manager menu is visible in the user's DirectAdmin panel.
+- `wordpress=OFF` — WordPress Manager menu is hidden (no sites are deleted).
 
-1. Log into DirectAdmin as the hosting user.
-2. Open **Installatron** or **Softaculous** from the user panel.
-3. Install WordPress in one click — credentials, database, and file permissions are all configured automatically by the installer.
-
-This keeps the extension lean and avoids hard-coding assumptions about which installer your server uses.
+Changing the checkbox on an existing service via Paymenter's upgrade flow re-pushes the `wordpress=ON/OFF` flag to DirectAdmin immediately.
 
 ---
 
@@ -94,11 +93,13 @@ DirectAdmin usernames are derived deterministically from the customer's email ad
    ```bash
    php artisan optimize:clear
    ```
-2. Verify the `wp_installer` field is **gone** from the DirectAdmin extension settings UI.
-3. Order with email `test.user@example.com` → DA user should be `testuser`.
-4. Second order from the same email → `testuser1`.
-5. Order with email `123@example.com` → `u123`.
-6. Confirm the WordPress checkbox on checkout results in a charge but **does not** install WordPress — the customer installs it manually via Installatron/Softaculous in the user panel.
+2. Order with storage 10 GB, WordPress **unchecked** → DA user should have `Domains limit = 1`, no WordPress Manager in menu.
+3. Order with storage 10 GB, WordPress **checked** → DA user should have `Domains limit = 1`, WordPress Manager visible under Advanced Features.
+4. On the first service, toggle the WordPress checkbox on via upgrade → DA user's WordPress Manager menu now appears (no data lost).
+5. Order with email `test.user@example.com` → DA user should be `testuser`.
+6. Second order from the same email → `testuser1`.
+7. Order with email `123@example.com` → `u123`.
+8. Existing accounts (provisioned before this PR) are NOT retroactively fixed — they keep their `vdomains=unlimited` until manually modified in DA or re-upgraded.
 
 ---
 

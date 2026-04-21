@@ -163,6 +163,7 @@ class DirectAdmin extends Server
         // Read configurable option values (keyed by option name in $properties)
         $storage   = $properties['storage'] ?? null;
         $bandwidth = $properties['bandwidth'] ?? null;
+        $wordpress = !empty($properties['wordpress']);
 
         if (isset($settings['ip'])) {
             $ip = $settings['ip'];
@@ -190,7 +191,7 @@ class DirectAdmin extends Server
             // Custom-limits mode: send inline resource limits instead of a named package.
             // Even if a package is configured in product settings it is used only as a label/fallback reference;
             // DirectAdmin custom= yes overrides it completely.
-            $payload = array_merge($payload, $this->buildCustomLimitsPayload((int) $storage, $bandwidth));
+            $payload = array_merge($payload, $this->buildCustomLimitsPayload((int) $storage, $bandwidth, $wordpress));
         } else {
             // Fallback: use the named package configured on the product.
             if (empty($settings['package'])) {
@@ -370,12 +371,13 @@ class DirectAdmin extends Server
 
         $storage   = $properties['storage'] ?? null;
         $bandwidth = $properties['bandwidth'] ?? null;
+        $wordpress = !empty($properties['wordpress']);
 
         if ($storage !== null) {
             $response = $this->request('/CMD_API_MODIFY_USER', 'post', array_merge([
                 'action' => 'customize',
                 'user'   => $username,
-            ], $this->buildCustomLimitsPayload((int) $storage, $bandwidth)), parse: true);
+            ], $this->buildCustomLimitsPayload((int) $storage, $bandwidth, $wordpress)), parse: true);
 
             if ($response['error'] != '0') {
                 throw new Exception('Error upgrading DirectAdmin account: ' . $response['text']);
@@ -388,20 +390,20 @@ class DirectAdmin extends Server
     /**
      * Build the DirectAdmin custom-limits payload array shared by createServer() and upgrade().
      */
-    private function buildCustomLimitsPayload(int $quota, $bandwidth): array
+    private function buildCustomLimitsPayload(int $quota, $bandwidth, bool $wordpress = false): array
     {
         return [
             'custom'      => 'yes',
             'quota'       => $quota,
             'bandwidth'   => $bandwidth ?: 'unlimited',
-            'vdomains'    => 'unlimited',
+            'vdomains'    => 1,
             'nsubdomains' => 'unlimited',
             'nemails'     => 'unlimited',
             'nemailf'     => 'unlimited',
             'nemailml'    => 'unlimited',
             'nemailr'     => 'unlimited',
             'mysql'       => 'unlimited',
-            'domainptr'   => 'unlimited',
+            'domainptr'   => 0,
             'ftp'         => 'unlimited',
             'aftp'        => 'ON',
             'cgi'         => 'ON',
@@ -413,6 +415,7 @@ class DirectAdmin extends Server
             'ssh'         => 'OFF',
             'sysinfo'     => 'ON',
             'dnscontrol'  => 'ON',
+            'wordpress'   => $wordpress ? 'ON' : 'OFF',
         ];
     }
 
