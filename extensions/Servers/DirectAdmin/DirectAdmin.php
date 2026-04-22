@@ -6,11 +6,17 @@ use App\Classes\Extension\Server;
 use App\Models\Service;
 use App\Rules\Domain;
 use Exception;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class DirectAdmin extends Server
 {
+    // -------------------------------------------------------------------------
+    // HTTP transport
+    // -------------------------------------------------------------------------
+
     private function request($endpoint, $method = 'get', $data = [], $parse = false)
     {
         $host = rtrim($this->config('host'), '/');
@@ -40,6 +46,10 @@ class DirectAdmin extends Server
 
         return $parsed;
     }
+
+    // -------------------------------------------------------------------------
+    // Extension configuration
+    // -------------------------------------------------------------------------
 
     /**
      * Get all the configuration for the extension
@@ -80,15 +90,12 @@ class DirectAdmin extends Server
     public function getProductConfig($values = []): array
     {
         $upackages = $this->request('/CMD_API_PACKAGES_USER', parse: true);
-        // Map to label => value pairs
         $upackages = array_map(function ($package) {
             return ['label' => $package, 'value' => $package];
         }, $upackages);
 
         try {
-            // If you are a reseller you won't have access to reseller packages
             $rpackages = $this->request('/CMD_API_PACKAGES_RESELLER', parse: true);
-            // Merge user packages with reseller packages
             $rpackages = array_map(function ($package) {
                 return ['label' => $package . ' (reseller)', 'value' => $package];
             }, $rpackages);
@@ -134,7 +141,7 @@ class DirectAdmin extends Server
     }
 
     /**
-     * Check if currenct configuration is valid
+     * Check if current configuration is valid
      */
     public function testConfig(): bool|string
     {
@@ -147,277 +154,62 @@ class DirectAdmin extends Server
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Customer-level property helpers (server-scoped keys)
+    //
+    // Each customer can theoretically have services on multiple DA servers.
+    // We namespace properties by server ID to avoid cross-server collisions.
+    // -------------------------------------------------------------------------
+
     /**
-     * Create a server
-     *
-     * @param  array  $settings  (product settings)
-     * @param  array  $properties  (checkout options / configurable option values)
-     * @return array
+     * Return the scoped property key for a customer-level DA property.
      */
-    public function createServer(Service $service, $settings, $properties)
+    private function customerPropKey(Service $service, string $name): string
     {
-        $password = substr(str_shuffle(str_repeat($x = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ(!@.$%', ceil(10 / strlen($x)))), 1, 12);
-        $username = $this->generateUsernameFromEmail($service->user->email);
-        $settings = array_merge($settings, $properties);
+        $serverId = $service->product->server_id;
 
-        // Read configurable option values (keyed by option name in $properties)
-        $storage   = $properties['storage'] ?? null;
-        $bandwidth = $properties['bandwidth'] ?? null;
-
-        if (isset($settings['ip'])) {
-            $ip = $settings['ip'];
-        } else {
-            $ip = $this->request('/CMD_API_SHOW_RESELLER_IPS', parse: true)[0] ?? null;
-
-            if (!$ip) {
-                throw new Exception('No IP address available for the server');
-            }
-        }
-
-        $payload = [
-            'action'   => 'create',
-            'add'      => 'Submit',
-            'username' => $username,
-            'email'    => $service->user->email,
-            'passwd'   => $password,
-            'passwd2'  => $password,
-            'ip'       => $ip,
-            'domain'   => $properties['domain'] ?? '',
-            'notify'   => 'yes',
-        ];
-
-        if ($storage !== null) {
-            // Custom-limits mode: send inline resource limits instead of a named package.
-            // Even if a package is configured in product settings it is used only as a label/fallback reference;
-            // DirectAdmin custom= yes overrides it completely.
-            $payload = array_merge($payload, $this->buildCustomLimitsPayload((int) $storage, $bandwidth));
-        } else {
-            // Fallback: use the named package configured on the product.
-            if (empty($settings['package'])) {
-                throw new Exception('No package configured and no storage configurable option provided');
-            }
-            $payload['package'] = $settings['package'];
-        }
-
-        $response = $this->request('/CMD_API_ACCOUNT_USER', 'post', $payload, parse: true);
-
-        if ($response['error'] != '0') {
-            throw new Exception('Error creating DirectAdmin account: ' . $response['text']);
-        }
-
-        $service->properties()->updateOrCreate([
-            'key' => 'directadmin_username',
-        ], [
-            'name' => 'DirectAdmin username',
-            'value' => $username,
-        ]);
-
-        $service->properties()->updateOrCreate([
-            'key' => 'directadmin_password',
-        ], [
-            'name' => 'DirectAdmin password',
-            'value' => $password,
-        ]);
-
-        return [
-            'username' => $username,
-            'password' => $password,
-            'domain'   => $properties['domain'] ?? '',
-            'ip'       => $ip,
-        ];
+        return 'directadmin_' . $name . '_' . $serverId;
     }
 
     /**
-     * Suspend a server
-     *
-     * @param  array  $settings  (product settings)
-     * @param  array  $properties  (checkout options)
-     * @return bool
+     * Read a customer-level property from the user's properties table.
      */
-    public function suspendServer(Service $service, $settings, $properties)
+    private function getCustomerProperty(Service $service, string $key): ?string
     {
-        if (!isset($properties['directadmin_username'])) {
-            throw new Exception('Service has not been created');
-        }
+        $fullKey = $this->customerPropKey($service, $key);
 
-        $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
-            'location' => 'CMD_SELECT_USERS',
-            'suspend' => 'suspend',
-            'select0' => $properties['directadmin_username'],
-        ], parse: true);
-
-        if ($response['error'] != '0') {
-            throw new Exception('Error suspending DirectAdmin account: ' . $response['text']);
-        }
-
-        return true;
+        return $service->user->properties()->where('key', $fullKey)->first()?->value;
     }
 
     /**
-     * Unsuspend a server
-     *
-     * @param  array  $settings  (product settings)
-     * @param  array  $properties  (checkout options)
-     * @return bool
+     * Write a customer-level property to the user's properties table.
      */
-    public function unsuspendServer(Service $service, $settings, $properties)
+    private function setCustomerProperty(Service $service, string $key, string $value): void
     {
-        if (!isset($properties['directadmin_username'])) {
-            throw new Exception('Service has not been created');
-        }
+        $fullKey = $this->customerPropKey($service, $key);
 
-        $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
-            'location' => 'CMD_SELECT_USERS',
-            'suspend' => 'unsuspend',
-            'select0' => $properties['directadmin_username'],
-        ], parse: true);
-
-        if ($response['error'] != '0') {
-            throw new Exception('Error unsuspending DirectAdmin account: ' . $response['text']);
-        }
-
-        return true;
+        $service->user->properties()->updateOrCreate(
+            ['key' => $fullKey],
+            ['name' => 'DirectAdmin ' . $key, 'value' => $value]
+        );
     }
 
     /**
-     * Terminate a server
-     *
-     * @param  array  $settings  (product settings)
-     * @param  array  $properties  (checkout options)
-     * @return bool
+     * Remove a customer-level property from the user's properties table.
      */
-    public function terminateServer(Service $service, $settings, $properties)
+    private function deleteCustomerProperty(Service $service, string $key): void
     {
-        if (!isset($properties['directadmin_username'])) {
-            throw new Exception('Service has not been created');
-        }
+        $fullKey = $this->customerPropKey($service, $key);
 
-        $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
-            'confirmed' => 'Confirm',
-            'delete' => 'yes',
-            'select0' => $properties['directadmin_username'],
-        ], parse: true);
-
-        if ($response['error'] != '0') {
-            throw new Exception('Error terminating DirectAdmin account: ' . $response['text']);
-        }
-
-        // Delete the properties
-        $service->properties()->where('key', 'directadmin_username')->delete();
-
-        return true;
+        $service->user->properties()->where('key', $fullKey)->delete();
     }
 
-    public function getActions(Service $service, $settings, $properties): array
-    {
-        if (!isset($properties['directadmin_username'], $properties['directadmin_password'])) {
-            return [];
-        }
-
-        return [
-            [
-                'label' => 'Access DirectAdmin',
-                'type' => 'button',
-                'function' => 'ssoLink',
-            ],
-        ];
-    }
-
-    public function ssoLink(Service $service, $settings, $properties): string
-    {
-        if (!isset($properties['directadmin_username'], $properties['directadmin_password'])) {
-            return '';
-        }
-
-        $response = Http::withBasicAuth($properties['directadmin_username'], $properties['directadmin_password'])
-            ->post(rtrim($this->config('host'), '/') . '/CMD_API_LOGIN_KEYS', [
-                'action' => 'create',
-                'type' => 'one_time_url',
-                'expiry' => '5m',
-            ])->throw();
-
-        $response = $this->parse($response);
-
-        if (!isset($response['error'])) {
-            throw new Exception('Unexpected DirectAdmin response while creating SSO link');
-        }
-
-        if ($response['error'] != '0') {
-            throw new Exception('Error creating DirectAdmin SSO link: ' . ($response['text'] ?? 'Unknown error'));
-        }
-
-        return $response['details'] ?? '';
-    }
+    // -------------------------------------------------------------------------
+    // Username derivation
+    // -------------------------------------------------------------------------
 
     /**
-     * Upgrade / change plan for an existing account.
-     *
-     * If a "storage" configurable option is present the account is updated with
-     * DirectAdmin's custom-limits mode; otherwise the call is a no-op (named
-     * package upgrades are handled outside this extension).
-     *
-     * @param  array  $settings    (product settings)
-     * @param  array  $properties  (configurable option values)
-     * @return bool
-     */
-    public function upgrade(Service $service, $settings, $properties)
-    {
-        $username = $service->properties()->where('key', 'directadmin_username')->first()?->value;
-
-        if (!$username) {
-            throw new Exception('Service has not been created');
-        }
-
-        $storage   = $properties['storage'] ?? null;
-        $bandwidth = $properties['bandwidth'] ?? null;
-
-        if ($storage !== null) {
-            $response = $this->request('/CMD_API_MODIFY_USER', 'post', array_merge([
-                'action' => 'customize',
-                'user'   => $username,
-            ], $this->buildCustomLimitsPayload((int) $storage, $bandwidth)), parse: true);
-
-            if ($response['error'] != '0') {
-                throw new Exception('Error upgrading DirectAdmin account: ' . $response['text']);
-            }
-        }
-
-        return true;
-    }
-
-    /**
-     * Build the DirectAdmin custom-limits payload array shared by createServer() and upgrade().
-     */
-    private function buildCustomLimitsPayload(int $quota, $bandwidth): array
-    {
-        return [
-            'custom'      => 'yes',
-            'quota'       => $quota,
-            'bandwidth'   => $bandwidth ?: 'unlimited',
-            'vdomains'    => 'unlimited',
-            'nsubdomains' => 'unlimited',
-            'nemails'     => 'unlimited',
-            'nemailf'     => 'unlimited',
-            'nemailml'    => 'unlimited',
-            'nemailr'     => 'unlimited',
-            'mysql'       => 'unlimited',
-            'domainptr'   => 'unlimited',
-            'ftp'         => 'unlimited',
-            'aftp'        => 'ON',
-            'cgi'         => 'ON',
-            'php'         => 'ON',
-            'spam'        => 'ON',
-            'cron'        => 'ON',
-            'catchall'    => 'ON',
-            'ssl'         => 'ON',
-            'ssh'         => 'OFF',
-            'sysinfo'     => 'ON',
-            'dnscontrol'  => 'ON',
-        ];
-    }
-
-    /**
-     * Derive a unique DirectAdmin username from the customer's email address.
+     * Derive a DirectAdmin username from a customer email address.
      *
      * Rules applied in order:
      *  1. Take the local part (before @), lowercase it.
@@ -428,6 +220,10 @@ class DirectAdmin extends Server
      *  6. Collision-check via GET /CMD_API_SHOW_USERS; append numeric suffix 1–99,
      *     then 3 random lowercase alphanum chars as last resort.
      *  7. Return unique username (always ≤ 16 chars).
+     *
+     * Collisions are only relevant for DIFFERENT customers that happen to map to
+     * the same base name.  The same customer reuses the stored username and never
+     * reaches this method.
      */
     private function generateUsernameFromEmail(string $email): string
     {
@@ -445,7 +241,6 @@ class DirectAdmin extends Server
         // Truncate to 14 to leave room for up to a 2-digit suffix within the 16-char limit.
         $base = substr($base, 0, 14);
 
-        // Fetch existing usernames for collision detection.
         try {
             $existing = $this->request('/CMD_API_SHOW_USERS', parse: true);
             if (!is_array($existing)) {
@@ -468,12 +263,679 @@ class DirectAdmin extends Server
             }
 
             if (!$found) {
-                // Last resort: 3 random lowercase alphanumeric chars.
-                // Re-truncate base to 13 so that base(13) + suffix(3) = 16 chars max.
+                // Last resort: re-truncate base to 13 so base(13) + suffix(3) = 16 chars max.
                 $candidate = substr($base, 0, 13) . strtolower(Str::random(3));
             }
         }
 
         return $candidate;
+    }
+
+    // -------------------------------------------------------------------------
+    // DA user provisioning helper
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return the existing DA user for this customer or signal that a new one
+     * must be created.
+     *
+     * @return array{username: string, password: string, isNew: bool}
+     */
+    private function getOrCreateDaUser(Service $service): array
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+
+        if ($username) {
+            $password = $this->getCustomerProperty($service, 'password');
+
+            return ['username' => $username, 'password' => $password, 'isNew' => false];
+        }
+
+        $username = $this->generateUsernameFromEmail($service->user->email);
+        // Generate a cryptographically random 16-character password.
+        $password = Str::password(16, letters: true, numbers: true, symbols: false);
+
+        return ['username' => $username, 'password' => $password, 'isNew' => true];
+    }
+
+    // -------------------------------------------------------------------------
+    // Sibling-service queries and option helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return all OTHER active/pending/suspended services for this customer on
+     * the same DA server extension, excluding the given service itself.
+     */
+    private function getCustomerActiveServices(Service $service): Collection
+    {
+        $serverId = $service->product->server_id;
+
+        return Service::where('user_id', $service->user_id)
+            ->where('id', '!=', $service->id)
+            ->whereIn('status', [
+                Service::STATUS_ACTIVE,
+                Service::STATUS_PENDING,
+                Service::STATUS_SUSPENDED,
+            ])
+            ->whereHas('product', function ($q) use ($serverId) {
+                $q->where('server_id', $serverId);
+            })
+            ->with(['configs.configOption', 'configs.configValue', 'properties'])
+            ->get();
+    }
+
+    /**
+     * Extract the relevant configurable-option values from a service's configs.
+     *
+     * Returns an array with keys matching the env_variable names of the options
+     * (e.g. 'storage', 'bandwidth', 'wordpress').
+     */
+    private function getServiceOptions(Service $service): array
+    {
+        $options = [];
+
+        foreach ($service->configs as $config) {
+            if ($config->configOption && $config->configValue) {
+                $options[$config->configOption->env_variable] =
+                    $config->configValue->env_variable ?? $config->configValue->name;
+            }
+        }
+
+        return $options;
+    }
+
+    // -------------------------------------------------------------------------
+    // Totals computation
+    // -------------------------------------------------------------------------
+
+    /**
+     * Compute the aggregate resource totals for the DA user that owns this
+     * service, optionally excluding one service (e.g. during termination) and
+     * optionally overriding the properties for the current service (e.g. during
+     * an upgrade where new values have not been persisted yet).
+     *
+     * @return array{storage: int, bandwidth: int|string, vdomains: int, wordpress: bool}
+     */
+    private function computeTotals(
+        Service $service,
+        ?Service $excluding = null,
+        ?array $overrideProperties = null
+    ): array {
+        $storage            = 0;
+        $bandwidth          = 0;
+        $bandwidthUnlimited = false;
+        $wordpress          = false;
+        $vdomains           = 0;
+
+        // Accumulate a single service's contribution into the running totals.
+        $accumulate = function (array $opts) use (
+            &$storage,
+            &$bandwidth,
+            &$bandwidthUnlimited,
+            &$wordpress,
+            &$vdomains
+        ): void {
+            $storage += (int) ($opts['storage'] ?? 0);
+
+            if (empty($opts['bandwidth'])) {
+                $bandwidthUnlimited = true;
+            } else {
+                $bandwidth += (int) $opts['bandwidth'];
+            }
+
+            if (!empty($opts['wordpress']) && $opts['wordpress'] !== '0') {
+                $wordpress = true;
+            }
+
+            $vdomains++;
+        };
+
+        // Include the current service (unless it is the one being excluded).
+        if ($excluding === null || $excluding->id !== $service->id) {
+            $opts = $overrideProperties !== null
+                ? $overrideProperties
+                : $this->getServiceOptions($service);
+            $accumulate($opts);
+        }
+
+        // Include sibling services.
+        foreach ($this->getCustomerActiveServices($service) as $sibling) {
+            if ($excluding !== null && $sibling->id === $excluding->id) {
+                continue;
+            }
+            $accumulate($this->getServiceOptions($sibling));
+        }
+
+        return [
+            'storage'   => $storage,
+            'bandwidth' => $bandwidthUnlimited ? 'unlimited' : $bandwidth,
+            'vdomains'  => $vdomains,
+            'wordpress' => $wordpress,
+        ];
+    }
+
+    // -------------------------------------------------------------------------
+    // DA API limit payload builder
+    // -------------------------------------------------------------------------
+
+    /**
+     * Build the DirectAdmin custom-limits payload from pre-computed totals.
+     *
+     * Used by both createServer() (via CMD_API_ACCOUNT_USER) and
+     * pushUserLimits() (via CMD_API_MODIFY_USER).
+     */
+    private function buildCustomLimitsPayload(array $totals): array
+    {
+        return [
+            'custom'      => 'yes',
+            'quota'       => $totals['storage'],
+            'bandwidth'   => $totals['bandwidth'],
+            'vdomains'    => $totals['vdomains'],
+            'domainptr'   => 0,
+            'nsubdomains' => 'unlimited',
+            'nemails'     => 'unlimited',
+            'nemailf'     => 'unlimited',
+            'nemailml'    => 'unlimited',
+            'nemailr'     => 'unlimited',
+            'mysql'       => 'unlimited',
+            'ftp'         => 'unlimited',
+            'aftp'        => 'ON',
+            'cgi'         => 'ON',
+            'php'         => 'ON',
+            'spam'        => 'ON',
+            'cron'        => 'ON',
+            'catchall'    => 'ON',
+            'ssl'         => 'ON',
+            'ssh'         => 'OFF',
+            'sysinfo'     => 'ON',
+            'dnscontrol'  => 'ON',
+            'wordpress'   => $totals['wordpress'] ? 'ON' : 'OFF',
+        ];
+    }
+
+    // -------------------------------------------------------------------------
+    // DA API wrappers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Push updated resource limits to an existing DA user.
+     */
+    private function pushUserLimits(string $username, array $totals): void
+    {
+        $response = $this->request('/CMD_API_MODIFY_USER', 'post', array_merge([
+            'action' => 'customize',
+            'user'   => $username,
+        ], $this->buildCustomLimitsPayload($totals)), parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error updating DirectAdmin user limits: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Add a domain to an existing DA user's account.
+     */
+    private function addDomainToUser(string $username, string $domain): void
+    {
+        $response = $this->request('/CMD_API_DOMAIN', 'post', [
+            'action'     => 'create',
+            'domain'     => $domain,
+            'ubandwidth' => 'ON',
+            'uquota'     => 'ON',
+            'user'       => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error adding domain to DirectAdmin user: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Remove a domain from a DA user's account.
+     */
+    private function removeDomainFromUser(string $username, string $domain): void
+    {
+        $response = $this->request('/CMD_API_DOMAIN', 'post', [
+            'action'  => 'delete',
+            'select0' => $domain,
+            'user'    => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error removing domain from DirectAdmin user: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Suspend a single domain on a DA user's account.
+     */
+    private function suspendDomain(string $username, string $domain): void
+    {
+        $response = $this->request('/CMD_API_DOMAIN', 'post', [
+            'action' => 'suspend',
+            'domain' => $domain,
+            'user'   => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error suspending DirectAdmin domain: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Unsuspend a single domain on a DA user's account.
+     */
+    private function unsuspendDomain(string $username, string $domain): void
+    {
+        $response = $this->request('/CMD_API_DOMAIN', 'post', [
+            'action' => 'unsuspend',
+            'domain' => $domain,
+            'user'   => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error unsuspending DirectAdmin domain: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Promote a domain to be the primary domain of a DA user.
+     *
+     * @param  string  $username         DA username
+     * @param  string  $currentPrimary   The current primary domain being replaced
+     * @param  string  $newPrimaryDomain The new primary domain to promote
+     */
+    private function promoteDomainToPrimary(string $username, string $currentPrimary, string $newPrimaryDomain): void
+    {
+        $response = $this->request('/CMD_API_CHANGE_DOMAIN', 'post', [
+            'old_domain' => $currentPrimary,
+            'new_domain' => $newPrimaryDomain,
+            'user'       => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error promoting domain to primary in DirectAdmin: ' . $response['text']);
+        }
+    }
+
+    /**
+     * Delete a DA user and all their data.
+     */
+    private function deleteDaUser(string $username): void
+    {
+        $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
+            'confirmed' => 'Confirm',
+            'delete'    => 'yes',
+            'select0'   => $username,
+        ], parse: true);
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error deleting DirectAdmin user: ' . $response['text']);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Main extension methods
+    // -------------------------------------------------------------------------
+
+    /**
+     * Create (or extend) a DirectAdmin hosting account for a service.
+     *
+     * Model: one DA user per Paymenter customer. Each service adds one domain.
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (checkout options / configurable option values)
+     * @return array
+     */
+    public function createServer(Service $service, $settings, $properties): array
+    {
+        $domain = $properties['domain'] ?? '';
+
+        if (isset($settings['ip'])) {
+            $ip = $settings['ip'];
+        } else {
+            $ip = $this->request('/CMD_API_SHOW_RESELLER_IPS', parse: true)[0] ?? null;
+
+            if (!$ip) {
+                throw new Exception('No IP address available for the server');
+            }
+        }
+
+        $daUser = $this->getOrCreateDaUser($service);
+        $username = $daUser['username'];
+        $password = $daUser['password'];
+
+        if ($daUser['isNew']) {
+            // -----------------------------------------------------------------
+            // First service for this customer: create the DA user account.
+            // -----------------------------------------------------------------
+            $totals  = $this->computeTotals($service, null, $properties);
+            $payload = array_merge([
+                'action'  => 'create',
+                'add'     => 'Submit',
+                'username' => $username,
+                'email'    => $service->user->email,
+                'passwd'   => $password,
+                'passwd2'  => $password,
+                'ip'       => $ip,
+                'domain'   => $domain,
+                'notify'   => 'yes',
+            ], $this->buildCustomLimitsPayload($totals));
+
+            // If no storage option is present on this service, fall back to a named package.
+            if (!isset($properties['storage'])) {
+                if (empty($settings['package'])) {
+                    throw new Exception('No package configured and no storage configurable option provided');
+                }
+                // Replace custom-limits keys with package name.
+                $payload = array_diff_key($payload, array_flip([
+                    'custom', 'quota', 'bandwidth', 'vdomains', 'domainptr',
+                    'nsubdomains', 'nemails', 'nemailf', 'nemailml', 'nemailr',
+                    'mysql', 'ftp', 'aftp', 'cgi', 'php', 'spam', 'cron',
+                    'catchall', 'ssl', 'ssh', 'sysinfo', 'dnscontrol', 'wordpress',
+                ]));
+                $payload['package'] = $settings['package'];
+            }
+
+            $response = $this->request('/CMD_API_ACCOUNT_USER', 'post', $payload, parse: true);
+
+            if ($response['error'] != '0') {
+                throw new Exception('Error creating DirectAdmin account: ' . $response['text']);
+            }
+
+            // Persist customer-level properties.
+            $this->setCustomerProperty($service, 'username', $username);
+            $this->setCustomerProperty($service, 'password', $password);
+            $this->setCustomerProperty($service, 'primary_domain', $domain);
+        } else {
+            // -----------------------------------------------------------------
+            // Subsequent service: add a domain to the existing DA user.
+            // -----------------------------------------------------------------
+            try {
+                $this->addDomainToUser($username, $domain);
+            } catch (Exception $e) {
+                Log::error('DirectAdmin createServer: failed to add domain', [
+                    'username' => $username,
+                    'domain'   => $domain,
+                    'error'    => $e->getMessage(),
+                ]);
+                throw $e;
+            }
+
+            try {
+                $totals = $this->computeTotals($service, null, $properties);
+                $this->pushUserLimits($username, $totals);
+            } catch (Exception $e) {
+                Log::error('DirectAdmin createServer: failed to push limits after adding domain', [
+                    'username' => $username,
+                    'domain'   => $domain,
+                    'error'    => $e->getMessage(),
+                ]);
+                throw $e;
+            }
+        }
+
+        // Persist per-service domain property.
+        $service->properties()->updateOrCreate(
+            ['key' => 'directadmin_domain'],
+            ['name' => 'DirectAdmin domain', 'value' => $domain]
+        );
+
+        return [
+            'username' => $username,
+            'password' => $password,
+            'domain'   => $domain,
+            'ip'       => $ip,
+        ];
+    }
+
+    /**
+     * Suspend a single service domain in DirectAdmin.
+     *
+     * Only the domain that belongs to this service is suspended; other services
+     * for the same customer continue to operate.
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (service properties / configurable option values)
+     * @return bool
+     */
+    public function suspendServer(Service $service, $settings, $properties): bool
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+
+        if (!$username) {
+            throw new Exception('Service has not been created');
+        }
+
+        $domain = $properties['directadmin_domain']
+            ?? $service->properties()->where('key', 'directadmin_domain')->first()?->value;
+
+        if ($domain) {
+            $this->suspendDomain($username, $domain);
+        } else {
+            // Legacy fallback: suspend the whole user account.
+            $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
+                'location' => 'CMD_SELECT_USERS',
+                'suspend'  => 'suspend',
+                'select0'  => $username,
+            ], parse: true);
+
+            if ($response['error'] != '0') {
+                throw new Exception('Error suspending DirectAdmin account: ' . $response['text']);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Unsuspend a single service domain in DirectAdmin.
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (service properties / configurable option values)
+     * @return bool
+     */
+    public function unsuspendServer(Service $service, $settings, $properties): bool
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+
+        if (!$username) {
+            throw new Exception('Service has not been created');
+        }
+
+        $domain = $properties['directadmin_domain']
+            ?? $service->properties()->where('key', 'directadmin_domain')->first()?->value;
+
+        if ($domain) {
+            $this->unsuspendDomain($username, $domain);
+        } else {
+            // Legacy fallback: unsuspend the whole user account.
+            $response = $this->request('/CMD_API_SELECT_USERS', 'post', [
+                'location' => 'CMD_SELECT_USERS',
+                'suspend'  => 'unsuspend',
+                'select0'  => $username,
+            ], parse: true);
+
+            if ($response['error'] != '0') {
+                throw new Exception('Error unsuspending DirectAdmin account: ' . $response['text']);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Terminate a service by removing its domain from the DA user.
+     *
+     * If this is the last service for the customer, the DA user account is
+     * deleted entirely and all customer-level properties are cleared.
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (service properties / configurable option values)
+     * @return bool
+     */
+    public function terminateServer(Service $service, $settings, $properties): bool
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+
+        if (!$username) {
+            throw new Exception('Service has not been created');
+        }
+
+        $domain = $properties['directadmin_domain']
+            ?? $service->properties()->where('key', 'directadmin_domain')->first()?->value;
+
+        $siblings = $this->getCustomerActiveServices($service);
+
+        if ($siblings->isEmpty()) {
+            // ----------------------------------------------------------------
+            // Last service — delete the entire DA user account.
+            // ----------------------------------------------------------------
+            $this->deleteDaUser($username);
+
+            $this->deleteCustomerProperty($service, 'username');
+            $this->deleteCustomerProperty($service, 'password');
+            $this->deleteCustomerProperty($service, 'primary_domain');
+        } else {
+            // ----------------------------------------------------------------
+            // Other services remain — remove only this domain.
+            // ----------------------------------------------------------------
+            $primaryDomain = $this->getCustomerProperty($service, 'primary_domain');
+
+            // If we are removing the primary domain, promote another one first.
+            if ($domain && $domain === $primaryDomain) {
+                $newPrimary = null;
+
+                foreach ($siblings as $sibling) {
+                    $sibDomain = $sibling->properties
+                        ->firstWhere('key', 'directadmin_domain')
+                        ?->value;
+                    if ($sibDomain && $sibDomain !== $domain) {
+                        $newPrimary = $sibDomain;
+                        break;
+                    }
+                }
+
+                if ($newPrimary) {
+                    try {
+                        $this->promoteDomainToPrimary($username, $domain, $newPrimary);
+                        $this->setCustomerProperty($service, 'primary_domain', $newPrimary);
+                    } catch (Exception $e) {
+                        Log::error('DirectAdmin terminateServer: failed to promote new primary domain', [
+                            'username'   => $username,
+                            'oldPrimary' => $domain,
+                            'newPrimary' => $newPrimary,
+                            'error'      => $e->getMessage(),
+                        ]);
+                        throw $e;
+                    }
+                }
+            }
+
+            if ($domain) {
+                try {
+                    $this->removeDomainFromUser($username, $domain);
+                } catch (Exception $e) {
+                    Log::error('DirectAdmin terminateServer: failed to remove domain', [
+                        'username' => $username,
+                        'domain'   => $domain,
+                        'error'    => $e->getMessage(),
+                    ]);
+                    throw $e;
+                }
+            }
+
+            try {
+                $totals = $this->computeTotals($service, $service);
+                $this->pushUserLimits($username, $totals);
+            } catch (Exception $e) {
+                Log::error('DirectAdmin terminateServer: failed to push updated limits', [
+                    'username' => $username,
+                    'error'    => $e->getMessage(),
+                ]);
+                throw $e;
+            }
+        }
+
+        // Remove the per-service domain property.
+        $service->properties()->where('key', 'directadmin_domain')->delete();
+
+        return true;
+    }
+
+    /**
+     * Upgrade resource limits for a service.
+     *
+     * Recomputes aggregate totals from all active services (including the
+     * newly-upgraded one) and pushes them to the shared DA user.
+     *
+     * @param  array  $settings    (product settings)
+     * @param  array  $properties  (new configurable option values)
+     * @return bool
+     */
+    public function upgradeServer(Service $service, $settings, $properties): bool
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+
+        if (!$username) {
+            throw new Exception('Service has not been created');
+        }
+
+        $totals = $this->computeTotals($service, null, $properties);
+
+        $this->pushUserLimits($username, $totals);
+
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Customer-facing actions
+    // -------------------------------------------------------------------------
+
+    public function getActions(Service $service, $settings, $properties): array
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+        $password = $this->getCustomerProperty($service, 'password');
+
+        if (!$username || !$password) {
+            return [];
+        }
+
+        return [
+            [
+                'label'    => 'Access DirectAdmin',
+                'type'     => 'button',
+                'function' => 'ssoLink',
+            ],
+        ];
+    }
+
+    public function ssoLink(Service $service, $settings, $properties): string
+    {
+        $username = $this->getCustomerProperty($service, 'username');
+        $password = $this->getCustomerProperty($service, 'password');
+
+        if (!$username || !$password) {
+            return '';
+        }
+
+        $response = Http::withBasicAuth($username, $password)
+            ->post(rtrim($this->config('host'), '/') . '/CMD_API_LOGIN_KEYS', [
+                'action' => 'create',
+                'type'   => 'one_time_url',
+                'expiry' => '5m',
+            ])->throw();
+
+        $response = $this->parse($response);
+
+        if (!isset($response['error'])) {
+            throw new Exception('Unexpected DirectAdmin response while creating SSO link');
+        }
+
+        if ($response['error'] != '0') {
+            throw new Exception('Error creating DirectAdmin SSO link: ' . ($response['text'] ?? 'Unknown error'));
+        }
+
+        return $response['details'] ?? '';
     }
 }
