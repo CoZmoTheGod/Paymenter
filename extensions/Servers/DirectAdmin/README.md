@@ -146,6 +146,8 @@ Existing DA accounts provisioned under the old per-service model (one DA user pe
 - **Manual consolidation**: Move the extra domains into a single DA account manually, then update the Paymenter service properties (`directadmin_domain` on each service, `directadmin_username_<id>` / `directadmin_password_<id>` / `directadmin_primary_domain_<id>` on the user).
 - **Natural expiry**: Let old accounts run until they are naturally terminated, at which point the extension deletes only the DA user associated with that last service.
 
+> **Important — ordering new services after migration:** If an existing customer has old-model services (no `directadmin_username_<serverId>` user property set) and places a **new** order, the extension will treat them as a new customer and create a fresh shared DA account. They will end up with both old separate DA accounts and a new shared one. To avoid this, perform the manual consolidation step first, ensuring the customer's `directadmin_username_<serverId>` user property is set to the consolidated DA username before they order again.
+
 ---
 
 ## Notes

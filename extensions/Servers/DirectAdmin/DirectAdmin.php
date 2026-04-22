@@ -292,16 +292,8 @@ class DirectAdmin extends Server
         }
 
         $username = $this->generateUsernameFromEmail($service->user->email);
-        $password = substr(
-            str_shuffle(
-                str_repeat(
-                    $x = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ(!@.$%',
-                    (int) ceil(12 / strlen($x))
-                )
-            ),
-            0,
-            12
-        );
+        // Generate a cryptographically random 16-character password.
+        $password = Str::password(16, letters: true, numbers: true, symbols: false);
 
         return ['username' => $username, 'password' => $password, 'isNew' => true];
     }
@@ -630,8 +622,8 @@ class DirectAdmin extends Server
                 'notify'   => 'yes',
             ], $this->buildCustomLimitsPayload($totals));
 
-            // If no storage option is present, fall back to a named package.
-            if (($totals['storage'] === 0) && empty($properties['storage'])) {
+            // If no storage option is present on this service, fall back to a named package.
+            if (!isset($properties['storage'])) {
                 if (empty($settings['package'])) {
                     throw new Exception('No package configured and no storage configurable option provided');
                 }
