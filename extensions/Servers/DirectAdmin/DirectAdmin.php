@@ -209,17 +209,40 @@ class DirectAdmin extends Server
     // -------------------------------------------------------------------------
 
     /**
-     * Derive a DirectAdmin username from a customer email address.
+     * Derive the base (non-collision-checked) DA username from an email address.
      *
-     * Rules applied in order:
+     * Rules:
      *  1. Take the local part (before @), lowercase it.
      *  2. Strip any character that is not [a-z0-9].
-     *  3. Empty result → fallback 'user' + 6 random lowercase chars.
+     *  3. Empty result → return empty string (caller must decide the fallback).
      *  4. First char is a digit → prefix 'u'.
-     *  5. Truncate base to 14 chars (reserves room for a 2-digit collision suffix).
-     *  6. Collision-check via GET /CMD_API_SHOW_USERS; append numeric suffix 1–99,
+     *  5. Truncate to 14 chars (reserves room for a 2-digit collision suffix).
+     */
+    private function deriveBaseUsername(string $email): string
+    {
+        $local = strtolower(explode('@', $email)[0]);
+        $base  = preg_replace('/[^a-z0-9]/', '', $local);
+
+        if ($base === '') {
+            return '';
+        }
+
+        if (ctype_digit($base[0])) {
+            $base = 'u' . $base;
+        }
+
+        return substr($base, 0, 14);
+    }
+
+    /**
+     * Derive a unique DirectAdmin username from a customer email address.
+     *
+     * Rules applied in order:
+     *  1. Derive the base username via deriveBaseUsername().
+     *  2. Empty base → fallback 'user' + 6 random lowercase chars.
+     *  3. Collision-check via GET /CMD_API_SHOW_USERS; append numeric suffix 1–99,
      *     then 3 random lowercase alphanum chars as last resort.
-     *  7. Return unique username (always ≤ 16 chars).
+     *  4. Return unique username (always ≤ 16 chars).
      *
      * Collisions are only relevant for DIFFERENT customers that happen to map to
      * the same base name.  The same customer reuses the stored username and never
@@ -227,19 +250,11 @@ class DirectAdmin extends Server
      */
     private function generateUsernameFromEmail(string $email): string
     {
-        $local = strtolower(explode('@', $email)[0]);
-        $base  = preg_replace('/[^a-z0-9]/', '', $local);
+        $base = $this->deriveBaseUsername($email);
 
         if ($base === '') {
             $base = 'user' . strtolower(Str::random(6));
         }
-
-        if (isset($base[0]) && ctype_digit($base[0])) {
-            $base = 'u' . $base;
-        }
-
-        // Truncate to 14 to leave room for up to a 2-digit suffix within the 16-char limit.
-        $base = substr($base, 0, 14);
 
         try {
             $existing = $this->request('/CMD_API_SHOW_USERS', parse: true);
@@ -279,6 +294,17 @@ class DirectAdmin extends Server
      * Return the existing DA user for this customer or signal that a new one
      * must be created.
      *
+     * Lookup order:
+     *  1. Stored user-level property (fast path, set on first provisioning).
+     *  2. DA API verification: derive the base username from the customer's
+     *     email, call CMD_API_SHOW_USER_CONFIG, and confirm the email matches.
+     *     This handles services created before the property was introduced and
+     *     cases where products share a DA server but have different server_ids
+     *     in Paymenter (which causes the property to be stored under a different
+     *     key and therefore not found in step 1).
+     *  3. If no existing DA account is found, signal that a new one must be
+     *     created.
+     *
      * @return array{username: string, password: string, isNew: bool}
      */
     private function getOrCreateDaUser(Service $service): array
@@ -291,7 +317,66 @@ class DirectAdmin extends Server
             return ['username' => $username, 'password' => $password, 'isNew' => false];
         }
 
-        $username = $this->generateUsernameFromEmail($service->user->email);
+        // --- Fallback: check the DA API for an account that already belongs
+        // --- to this customer (identified by matching e-mail address).
+        $email = $service->user->email;
+        $base  = $this->deriveBaseUsername($email);
+
+        if ($base !== '') {
+            try {
+                $config = $this->request(
+                    '/CMD_API_SHOW_USER_CONFIG?user=' . urlencode($base),
+                    parse: true
+                );
+
+                if (
+                    isset($config['email']) &&
+                    strtolower($config['email']) === strtolower($email)
+                ) {
+                    // DA account exists and belongs to this customer — reuse it.
+                    // The email comparison above is the security gate: only an account
+                    // whose recorded email exactly matches this customer's email is
+                    // considered theirs, preventing any cross-customer collision.
+                    $password = $this->getCustomerProperty($service, 'password');
+
+                    if (!$password) {
+                        // No password on record — generate a new one and push it
+                        // to DirectAdmin so Paymenter and DA stay in sync.
+                        $password = Str::password(16, letters: true, numbers: true, symbols: false);
+
+                        Log::warning('DirectAdmin getOrCreateDaUser: resetting password for recovered account', [
+                            'username' => $base,
+                            'user_id'  => $service->user_id,
+                        ]);
+
+                        $pwResponse = $this->request('/CMD_API_MODIFY_USER', 'post', [
+                            'action'  => 'password',
+                            'user'    => $base,
+                            'passwd'  => $password,
+                            'passwd2' => $password,
+                        ], parse: true);
+
+                        if ($pwResponse['error'] !== '0') {
+                            throw new Exception('Error resetting DirectAdmin user password: ' . $pwResponse['text']);
+                        }
+                    }
+
+                    $this->setCustomerProperty($service, 'username', $base);
+                    $this->setCustomerProperty($service, 'password', $password);
+
+                    return ['username' => $base, 'password' => $password, 'isNew' => false];
+                }
+            } catch (Exception $e) {
+                // DA returned an error (user does not exist or permission denied) —
+                // fall through and create a fresh account.
+                Log::debug('DirectAdmin getOrCreateDaUser: user config lookup failed', [
+                    'candidate' => $base,
+                    'error'     => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $username = $this->generateUsernameFromEmail($email);
         // Generate a cryptographically random 16-character password.
         $password = Str::password(16, letters: true, numbers: true, symbols: false);
 
